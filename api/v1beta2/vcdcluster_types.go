@@ -46,11 +46,15 @@ type UserCredentialsContext struct {
 // VCDResources provide records of the latest ID and name of some VCD Resources.
 type VCDResources []VCDResource
 
+type VCDResourceMap struct {
+	Ovdcs VCDResources `json:"ovdcs,omitempty"`
+}
+
 // VCDResource restores the data structure for some VCD Resources
 type VCDResource struct {
 	Type string `json:"type,omitempty"`
-	ID   string `json:"id,omitempty"`
-	Name string `json:"name,omitempty"`
+	ID   string `json:"id"`
+	Name string `json:"name"`
 }
 
 // ProxyConfig defines HTTP proxy environment variables for containerd
@@ -128,8 +132,7 @@ type VCDClusterStatus struct {
 	// optional
 	Site string `json:"site,omitempty"`
 
-	//optional
-	VcdResourceMap map[string]VCDResources `json:"vcdResourceMap,omitempty"`
+	VcdResourceMap VCDResourceMap `json:"vcdResourceMap,omitempty"`
 
 	// optional
 	Org string `json:"org,omitempty"`

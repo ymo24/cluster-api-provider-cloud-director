@@ -1,8 +1,6 @@
 apiVersion: v1
 kind: Namespace
 metadata:
-  labels:
-    cluster.x-k8s.io/provider: infrastructure-vcd
   name: capvcd-system
 ---
 apiVersion: apiextensions.k8s.io/v1
@@ -12,7 +10,6 @@ metadata:
     cert-manager.io/inject-ca-from: capvcd-system/capvcd-serving-cert
     controller-gen.kubebuilder.io/version: v0.4.1
   labels:
-    cluster.x-k8s.io/provider: infrastructure-vcd
     cluster.x-k8s.io/v1alpha4: v1alpha4
     cluster.x-k8s.io/v1beta1: v1beta2
     clusterctl.cluster.x-k8s.io: ""
@@ -491,20 +488,23 @@ spec:
                 description: MetadataUpdated denotes that the metadata of Vapp is updated.
                 type: boolean
               vcdResourceMap:
-                additionalProperties:
-                  description: VCDResources provide records of the latest ID and name of some VCD Resources.
-                  items:
-                    description: VCDResource restores the data structure for some VCD Resources
-                    properties:
-                      id:
-                        type: string
-                      name:
-                        type: string
-                      type:
-                        type: string
-                    type: object
-                  type: array
-                description: optional
+                properties:
+                  ovdcs:
+                    description: VCDResources provide records of the latest ID and name of some VCD Resources.
+                    items:
+                      description: VCDResource restores the data structure for some VCD Resources
+                      properties:
+                        id:
+                          type: string
+                        name:
+                          type: string
+                        type:
+                          type: string
+                      required:
+                      - id
+                      - name
+                      type: object
+                    type: array
                 type: object
             required:
             - rdeVersionInUse
@@ -531,7 +531,6 @@ metadata:
     controller-gen.kubebuilder.io/version: v0.4.1
   creationTimestamp: null
   labels:
-    cluster.x-k8s.io/provider: infrastructure-vcd
     cluster.x-k8s.io/v1alpha4: v1alpha4
     cluster.x-k8s.io/v1beta1: v1beta2
     clusterctl.cluster.x-k8s.io: ""
@@ -665,7 +664,6 @@ metadata:
     cert-manager.io/inject-ca-from: capvcd-system/capvcd-serving-cert
     controller-gen.kubebuilder.io/version: v0.4.1
   labels:
-    cluster.x-k8s.io/provider: infrastructure-vcd
     cluster.x-k8s.io/v1alpha4: v1alpha4
     cluster.x-k8s.io/v1beta1: v1beta2
     clusterctl.cluster.x-k8s.io: ""
@@ -1057,7 +1055,6 @@ metadata:
     cert-manager.io/inject-ca-from: capvcd-system/capvcd-serving-cert
     controller-gen.kubebuilder.io/version: v0.4.1
   labels:
-    cluster.x-k8s.io/provider: infrastructure-vcd
     cluster.x-k8s.io/v1alpha4: v1alpha4
     cluster.x-k8s.io/v1beta1: v1beta2
     clusterctl.cluster.x-k8s.io: ""
@@ -1297,251 +1294,19 @@ status:
   storedVersions: []
 ---
 apiVersion: v1
-kind: ServiceAccount
+kind: Endpoints
 metadata:
-  labels:
-    cluster.x-k8s.io/provider: infrastructure-vcd
-  name: capvcd-controller-manager
+  name: capvcd-webhook-service
   namespace: capvcd-system
----
-apiVersion: rbac.authorization.k8s.io/v1
-kind: Role
-metadata:
-  labels:
-    cluster.x-k8s.io/provider: infrastructure-vcd
-  name: capvcd-leader-election-role
-  namespace: capvcd-system
-rules:
-- apiGroups:
-  - ""
-  resources:
-  - configmaps
-  verbs:
-  - get
-  - list
-  - watch
-  - create
-  - update
-  - patch
-  - delete
-- apiGroups:
-  - coordination.k8s.io
-  resources:
-  - leases
-  verbs:
-  - get
-  - list
-  - watch
-  - create
-  - update
-  - patch
-  - delete
-- apiGroups:
-  - ""
-  resources:
-  - events
-  verbs:
-  - create
-  - patch
----
-apiVersion: rbac.authorization.k8s.io/v1
-kind: ClusterRole
-metadata:
-  creationTimestamp: null
-  labels:
-    cluster.x-k8s.io/provider: infrastructure-vcd
-  name: capvcd-manager-role
-rules:
-- apiGroups:
-  - ""
-  resources:
-  - events
-  verbs:
-  - create
-  - get
-  - list
-  - patch
-  - update
-  - watch
-- apiGroups:
-  - ""
-  resources:
-  - namespaces
-  verbs:
-  - get
-  - list
-  - watch
-- apiGroups:
-  - ""
-  resources:
-  - secrets
-  verbs:
-  - get
-  - list
-  - watch
-- apiGroups:
-  - addons.cluster.x-k8s.io
-  resources:
-  - clusterresourcesetbindings
-  verbs:
-  - get
-  - list
-  - watch
-- apiGroups:
-  - bootstrap.cluster.x-k8s.io
-  resources:
-  - kubeadmconfigtemplates
-  verbs:
-  - create
-  - delete
-  - get
-  - list
-  - patch
-  - update
-  - watch
-- apiGroups:
-  - cluster.x-k8s.io
-  resources:
-  - clusters
-  - clusters/status
-  verbs:
-  - get
-  - list
-  - watch
-- apiGroups:
-  - cluster.x-k8s.io
-  resources:
-  - machinedeployments
-  verbs:
-  - create
-  - delete
-  - get
-  - list
-  - patch
-  - update
-  - watch
-- apiGroups:
-  - cluster.x-k8s.io
-  resources:
-  - machines
-  - machines/status
-  verbs:
-  - get
-  - list
-  - watch
-- apiGroups:
-  - controlplane.cluster.x-k8s.io
-  resources:
-  - kubeadmcontrolplanes
-  verbs:
-  - create
-  - delete
-  - get
-  - list
-  - patch
-  - update
-  - watch
-- apiGroups:
-  - infrastructure.cluster.x-k8s.io
-  resources:
-  - vcdclusters
-  verbs:
-  - create
-  - delete
-  - get
-  - list
-  - patch
-  - update
-  - watch
-- apiGroups:
-  - infrastructure.cluster.x-k8s.io
-  resources:
-  - vcdclusters/finalizers
-  verbs:
-  - update
-- apiGroups:
-  - infrastructure.cluster.x-k8s.io
-  resources:
-  - vcdclusters/status
-  verbs:
-  - get
-  - patch
-  - update
-- apiGroups:
-  - infrastructure.cluster.x-k8s.io
-  resources:
-  - vcdmachines
-  verbs:
-  - create
-  - delete
-  - get
-  - list
-  - patch
-  - update
-  - watch
-- apiGroups:
-  - infrastructure.cluster.x-k8s.io
-  resources:
-  - vcdmachines/finalizers
-  verbs:
-  - update
-- apiGroups:
-  - infrastructure.cluster.x-k8s.io
-  resources:
-  - vcdmachines/status
-  verbs:
-  - get
-  - patch
-  - update
-- apiGroups:
-  - infrastructure.cluster.x-k8s.io
-  resources:
-  - vcdmachinetemplates
-  verbs:
-  - create
-  - delete
-  - get
-  - list
-  - patch
-  - update
-  - watch
----
-apiVersion: rbac.authorization.k8s.io/v1
-kind: RoleBinding
-metadata:
-  labels:
-    cluster.x-k8s.io/provider: infrastructure-vcd
-  name: capvcd-leader-election-rolebinding
-  namespace: capvcd-system
-roleRef:
-  apiGroup: rbac.authorization.k8s.io
-  kind: Role
-  name: capvcd-leader-election-role
-subjects:
-- kind: ServiceAccount
-  name: capvcd-controller-manager
-  namespace: capvcd-system
----
-apiVersion: rbac.authorization.k8s.io/v1
-kind: ClusterRoleBinding
-metadata:
-  labels:
-    cluster.x-k8s.io/provider: infrastructure-vcd
-  name: capvcd-manager-rolebinding
-roleRef:
-  apiGroup: rbac.authorization.k8s.io
-  kind: ClusterRole
-  name: capvcd-manager-role
-subjects:
-- kind: ServiceAccount
-  name: capvcd-controller-manager
-  namespace: capvcd-system
+subsets:
+- addresses:
+  - ip: 192.168.1.98
+  ports:
+  - port: 9443
 ---
 apiVersion: v1
 kind: Service
 metadata:
-  labels:
-    cluster.x-k8s.io/provider: infrastructure-vcd
   name: capvcd-webhook-service
   namespace: capvcd-system
 spec:
@@ -1549,81 +1314,10 @@ spec:
   - port: 443
     protocol: TCP
     targetPort: 9443
-  selector:
-    cluster.x-k8s.io/provider: infrastructure-vcd
-    control-plane: controller-manager
----
-apiVersion: apps/v1
-kind: Deployment
-metadata:
-  labels:
-    cluster.x-k8s.io/provider: infrastructure-vcd
-    control-plane: controller-manager
-  name: capvcd-controller-manager
-  namespace: capvcd-system
-spec:
-  replicas: 1
-  selector:
-    matchLabels:
-      cluster.x-k8s.io/provider: infrastructure-vcd
-      control-plane: controller-manager
-  template:
-    metadata:
-      labels:
-        cluster.x-k8s.io/provider: infrastructure-vcd
-        control-plane: controller-manager
-    spec:
-      containers:
-      - command:
-        - /opt/vcloud/bin/cluster-api-provider-cloud-director
-        image: harbor-repo.vmware.com/vcloud/cluster-api-provider-cloud-director:main-branch.6409b2b
-        livenessProbe:
-          httpGet:
-            path: /healthz
-            port: 8081
-          initialDelaySeconds: 15
-          periodSeconds: 20
-        name: manager
-        ports:
-        - containerPort: 9443
-          name: webhook-server
-          protocol: TCP
-        readinessProbe:
-          httpGet:
-            path: /readyz
-            port: 8081
-          initialDelaySeconds: 5
-          periodSeconds: 10
-        resources:
-          limits:
-            cpu: 1000m
-            memory: 2048Mi
-          requests:
-            cpu: 100m
-            memory: 512Mi
-        securityContext:
-          allowPrivilegeEscalation: false
-        volumeMounts:
-        - mountPath: /tmp/k8s-webhook-server/serving-certs
-          name: cert
-          readOnly: true
-      securityContext:
-        fsGroup: 2000
-        runAsGroup: 3000
-        runAsUser: 1000
-      serviceAccountName: capvcd-controller-manager
-      terminationGracePeriodSeconds: 10
-      volumes:
-      - name: cert
-        secret:
-          defaultMode: 420
-          secretName: capvcd-webhook-server-cert
 ---
 apiVersion: cert-manager.io/v1
 kind: Certificate
 metadata:
-  labels:
-    cluster.x-k8s.io/provider: infrastructure-vcd
   name: capvcd-serving-cert
   namespace: capvcd-system
 spec:
@@ -1638,8 +1332,6 @@ spec:
 apiVersion: cert-manager.io/v1
 kind: Issuer
 metadata:
-  labels:
-    cluster.x-k8s.io/provider: infrastructure-vcd
   name: capvcd-selfsigned-issuer
   namespace: capvcd-system
 spec:
@@ -1650,8 +1342,6 @@ kind: MutatingWebhookConfiguration
 metadata:
   annotations:
     cert-manager.io/inject-ca-from: capvcd-system/capvcd-serving-cert
-  labels:
-    cluster.x-k8s.io/provider: infrastructure-vcd
   name: capvcd-mutating-webhook-configuration
 webhooks:
 - admissionReviewVersions:
@@ -1700,8 +1390,6 @@ kind: ValidatingWebhookConfiguration
 metadata:
   annotations:
     cert-manager.io/inject-ca-from: capvcd-system/capvcd-serving-cert
-  labels:
-    cluster.x-k8s.io/provider: infrastructure-vcd
   name: capvcd-validating-webhook-configuration
 webhooks:
 - admissionReviewVersions:
