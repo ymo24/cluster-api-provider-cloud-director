@@ -22,7 +22,7 @@ import (
 	"github.com/pkg/errors"
 	vcdsdkutil "github.com/vmware/cloud-provider-for-cloud-director/pkg/util"
 	"github.com/vmware/cloud-provider-for-cloud-director/pkg/vcdsdk"
-	swagger "github.com/vmware/cloud-provider-for-cloud-director/pkg/vcdswaggerclient"
+	swagger "github.com/vmware/cloud-provider-for-cloud-director/pkg/vcdswaggerclient_36_0"
 	infrav1 "github.com/vmware/cluster-api-provider-cloud-director/api/v1beta2"
 	"github.com/vmware/cluster-api-provider-cloud-director/pkg/capisdk"
 	vcdutil "github.com/vmware/cluster-api-provider-cloud-director/pkg/util"
@@ -47,9 +47,9 @@ import (
 const (
 	EnvSkipRDE = "CAPVCD_SKIP_RDE"
 
-	RDEStatusResolved = "RESOLVED"
-	VCDLocationHeader = "Location"
-
+	RDEStatusResolved             = "RESOLVED"
+	VCDLocationHeader             = "Location"
+	ResourceTypeOvdc              = "ovdc"
 	ClusterApiStatusPhaseReady    = "Ready"
 	ClusterApiStatusPhaseNotReady = "Not Ready"
 	CapvcdInfraId                 = "CapvcdInfraId"
@@ -243,6 +243,53 @@ func validateDerivedRDEProperties(vcdCluster *infrav1.VCDCluster, infraID string
 		vcdCluster.Name, vcdCluster.Status.RdeVersionInUse, rdeVersionInUse)
 }
 
+// updateClientWithVDC is to add the latest VDC into vcdClient.
+// Reminder: Although vcdcluster provides array for vcdResourceMap[ovdc], vcdcluster should use use only one OVDC in CAPVCD 1.1
+func updateClientWithVDC(vcdCluster *infrav1.VCDCluster, client *vcdsdk.Client) error {
+	log := ctrl.LoggerFrom(context.Background())
+	orgName := vcdCluster.Spec.Org
+	ovdcName := vcdCluster.Spec.Ovdc
+	if vcdCluster.Status.VcdResourceMap.Ovdcs != nil && len(vcdCluster.Status.VcdResourceMap.Ovdcs) > 0 {
+		NameChanged, newOvdc, err := checkIfOvdcNameChange(vcdCluster, client)
+		if err != nil {
+			return fmt.Errorf("error occurred while updating the client with VDC: [%v]", err)
+		}
+		if newOvdc == nil {
+			return fmt.Errorf("error occurred while updating the client with VDC as the new ovdc is empty")
+		}
+		if NameChanged {
+			ovdcName = newOvdc.Vdc.Name
+			vcdCluster.Spec.Ovdc = newOvdc.Vdc.Name
+			log.Info("updating vcdCluster with the following data", "vcdCluster.Status.VcdResourceMap[ovdc].ID", client.VDC.Vdc.ID, "vcdCluster.Status.VcdResourceMap[ovdc].Name", client.VDC.Vdc.Name)
+		}
+	}
+	newOvdc, err := getOvdcByName(client, orgName, ovdcName)
+	if err != nil {
+		return fmt.Errorf("failed to get the ovdc by the name [%s]: [%v]", ovdcName, err)
+	}
+	client.VDC = newOvdc
+	client.ClusterOVDCName = newOvdc.Vdc.Name
+
+	return nil
+}
+
+func createVCDClientFromSecrets(ctx context.Context, client client.Client, vcdCluster *infrav1.VCDCluster) (*vcdsdk.Client, error) {
+	userCreds, err := getUserCredentialsForCluster(ctx, client, vcdCluster.Spec.UserCredentialsContext)
+	if err != nil {
+		return nil, fmt.Errorf("error getting client credentials to reconcile Cluster [%s] infrastructure: [%v]", vcdCluster.Name, err)
+	}
+	workloadVCDClient, err := vcdsdk.NewVCDClientFromSecrets(vcdCluster.Spec.Site, vcdCluster.Spec.Org,
+		vcdCluster.Spec.Ovdc, vcdCluster.Spec.Org, userCreds.Username, userCreds.Password, userCreds.RefreshToken, true, false)
+	if err != nil {
+		return nil, fmt.Errorf("error creating VCD client from secrets to reconcile Cluster [%s] infrastructure: [%v]", vcdCluster.Name, err)
+	}
+	err = updateClientWithVDC(vcdCluster, workloadVCDClient)
+	if err != nil {
+		return nil, fmt.Errorf("error updating VCD client with VDC to reconcile Cluster [%s] infrastructure: [%v]", vcdCluster.Name, err)
+	}
+	return workloadVCDClient, nil
+}
+
 // TODO: Remove uncommented code when decision to only keep capi.yaml as part of RDE spec is finalized
 func (r *VCDClusterReconciler) constructCapvcdRDE(ctx context.Context, cluster *clusterv1.Cluster,
 	vcdCluster *infrav1.VCDCluster, vdc *types.Vdc, vcdOrg *types.Org) (*swagger.DefinedEntity, error) {
@@ -312,7 +359,7 @@ func (r *VCDClusterReconciler) constructCapvcdRDE(ctx context.Context, cluster *
 					ApiEndpoints: []rdeType.ApiEndpoints{},
 				},
 				NodePool:               nil,
-				CapvcdVersion:          release.CAPVCDVersion,
+				CapvcdVersion:          release.Version,
 				UseAsManagementCluster: vcdCluster.Spec.UseAsManagementCluster,
 				K8sNetwork: rdeType.K8sNetwork{
 					Pods: rdeType.Pods{
@@ -330,7 +377,7 @@ func (r *VCDClusterReconciler) constructCapvcdRDE(ctx context.Context, cluster *
 				},
 				CapiStatusYaml:             "",
 				ClusterResourceSetBindings: nil,
-				CreatedByVersion:           release.CAPVCDVersion,
+				CreatedByVersion:           release.Version,
 				Upgrade: rdeType.Upgrade{
 					Current: &rdeType.K8sInfo{
 						K8sVersion: kubernetesVersion,
@@ -356,12 +403,9 @@ func (r *VCDClusterReconciler) constructCapvcdRDE(ctx context.Context, cluster *
 func (r *VCDClusterReconciler) constructAndCreateRDEFromCluster(ctx context.Context, workloadVCDClient *vcdsdk.Client, cluster *clusterv1.Cluster, vcdCluster *infrav1.VCDCluster) (string, error) {
 	log := ctrl.LoggerFrom(ctx)
 
-	org, err := workloadVCDClient.VCDClient.GetOrgByName(vcdCluster.Spec.Org)
+	org, err := getOrgByName(workloadVCDClient, vcdCluster.Spec.Org)
 	if err != nil {
-		return "", fmt.Errorf("failed to get org by name [%s]", vcdCluster.Spec.Org)
-	}
-	if org == nil || org.Org == nil {
-		return "", fmt.Errorf("found nil org when getting org by name [%s]", vcdCluster.Spec.Org)
+		return "", fmt.Errorf("error occurred while constructing RDE from cluster [%s]", vcdCluster.Status.InfraId)
 	}
 	rde, err := r.constructCapvcdRDE(ctx, cluster, vcdCluster, workloadVCDClient.VDC.Vdc, org.Org)
 	if err != nil {
@@ -626,8 +670,8 @@ func (r *VCDClusterReconciler) reconcileRDE(ctx context.Context, cluster *cluste
 			capvcdStatusPatch["Private.KubeConfig"] = string(kubeConfigBytes)
 		}
 	}
-	if release.CAPVCDVersion != capvcdStatus.CapvcdVersion {
-		capvcdStatusPatch["CapvcdVersion"] = release.CAPVCDVersion
+	if release.Version != capvcdStatus.CapvcdVersion {
+		capvcdStatusPatch["CapvcdVersion"] = release.Version
 	}
 
 	updatedRDE, err := capvcdRdeManager.PatchRDE(ctx, specPatch, metadataPatch, capvcdStatusPatch, vcdCluster.Status.InfraId, vappID, updateExternalID)
@@ -641,7 +685,7 @@ func (r *VCDClusterReconciler) reconcileRDE(ctx context.Context, cluster *cluste
 		if err != nil {
 			return fmt.Errorf("failed to resolve defined entity with ID [%s] for cluster [%s]", vcdCluster.Status.InfraId, vcdCluster.Name)
 		}
-		if resp.StatusCode != http.StatusOK {
+		if resp != nil && resp.StatusCode != http.StatusOK {
 			return fmt.Errorf("error while resolving defined entity with ID [%s] for cluster [%s] with message: [%s]", vcdCluster.Status.InfraId, vcdCluster.Name, entityState.Message)
 		}
 		if entityState.State != RDEStatusResolved {
@@ -659,15 +703,23 @@ func (r *VCDClusterReconciler) reconcileNormal(ctx context.Context, cluster *clu
 
 	// To avoid spamming RDEs with updates, only update the RDE with events when machine creation is ongoing
 	skipRDEEventUpdates := clusterv1.ClusterPhase(cluster.Status.Phase) == clusterv1.ClusterPhaseProvisioned
-
-	userCreds, err := getUserCredentialsForCluster(ctx, r.Client, vcdCluster.Spec.UserCredentialsContext)
-	if err != nil {
-		return ctrl.Result{}, errors.Wrapf(err, "Error getting client credentials to reconcile Cluster [%s] infrastructure", vcdCluster.Name)
-	}
-	workloadVCDClient, err := vcdsdk.NewVCDClientFromSecrets(vcdCluster.Spec.Site, vcdCluster.Spec.Org,
-		vcdCluster.Spec.Ovdc, vcdCluster.Spec.Org, userCreds.Username, userCreds.Password, userCreds.RefreshToken, true, true)
+	workloadVCDClient, err := createVCDClientFromSecrets(ctx, r.Client, vcdCluster)
 	if err != nil {
 		return ctrl.Result{}, errors.Wrapf(err, "Error creating VCD client to reconcile Cluster [%s] infrastructure", vcdCluster.Name)
+	}
+	// close all idle connections when reconciliation is done
+	defer func() {
+		if workloadVCDClient != nil && workloadVCDClient.VCDClient != nil {
+			workloadVCDClient.VCDClient.Client.Http.CloseIdleConnections()
+			log.Info(fmt.Sprintf("closed connection to the http client [%#v]", workloadVCDClient.VCDClient.Client.Http))
+		}
+	}()
+	if workloadVCDClient.VDC == nil || workloadVCDClient.VDC.Vdc == nil {
+		return ctrl.Result{}, errors.Wrapf(err, "failed to get the Organization VDC (OVDC) from the VCD client for reconciling infrastructure of Cluster [%s]", vcdCluster.Name)
+	}
+	err = updateVcdResourceToVcdCluster(vcdCluster, ResourceTypeOvdc, workloadVCDClient.VDC.Vdc.ID, workloadVCDClient.VDC.Vdc.Name)
+	if err != nil {
+		return ctrl.Result{}, errors.Wrapf(err, "Error updating vcdResource into vcdcluster.status to reconcile Cluster [%s] infrastructure", vcdCluster.Name)
 	}
 	// General note on RDE operations, always ensure CAPVCD cluster reconciliation progress
 	//is not affected by any RDE operation failures.
@@ -697,7 +749,9 @@ func (r *VCDClusterReconciler) reconcileNormal(ctx context.Context, cluster *clu
 	// 2. Clusters which are newly created should check for CAPVCD_SKIP_RDE environment variable to determine if an RDE should be created for the cluster
 
 	// NOTE: If CAPVCD_SKIP_RDE is not set, CAPVCD will error out if there is any error in RDE creation
-	rdeVersionInUse := vcdCluster.Status.RdeVersionInUse
+	// rdeVersionInUseByCluster is the current version of the RDE associated with the cluster. Note that this version can be different from the latest RDE version used by the CAPVCD product.
+	// In such cases, RDE version of the cluster will be upgraded to the latest RDE version used by CAPVCD.
+	rdeVersionInUseByCluster := vcdCluster.Status.RdeVersionInUse
 	if infraID == "" {
 		// Create RDE for the cluster or generate a NO_RDE infra ID for the cluster.
 		if !SkipRDE {
@@ -770,27 +824,29 @@ func (r *VCDClusterReconciler) reconcileNormal(ctx context.Context, cluster *clu
 						return ctrl.Result{}, errors.Wrapf(err, "error creating RDE for the cluster %s", vcdCluster.Name)
 					}
 					infraID = rdeID
+					rdeVersionInUseByCluster = rdeType.CapvcdRDETypeVersion
 				} else {
 					log.Info("RDE for the cluster is already present; skipping RDE creation", "InfraId",
 						definedEntities.Values[0].Id)
 					infraID = definedEntities.Values[0].Id
+					entityTypeArr := strings.Split(definedEntities.Values[0].EntityType, ":")
+					rdeVersionInUseByCluster = entityTypeArr[len(entityTypeArr)-1]
 				}
 			}
-			rdeVersionInUse = rdeType.CapvcdRDETypeVersion
 		} else {
 			// If there is no RDE ID specified (or) created for any reason, self-generate one and use.
 			// We need UUIDs to single-instance cleanly in the Virtual Services etc.
 			noRDEID := NoRdePrefix + uuid.New().String()
 			log.Info("Error retrieving InfraId. Hence using a self-generated UUID", "UUID", noRDEID)
 			infraID = noRDEID
-			rdeVersionInUse = NoRdePrefix
+			rdeVersionInUseByCluster = NoRdePrefix
 		}
 
 	} else {
 		log.V(3).Info("Reusing already available InfraID", "infraID", infraID)
 		if strings.HasPrefix(infraID, NoRdePrefix) {
 			log.V(3).Info("Infra ID has NO_RDE_ prefix. Using RdeVersionInUse -", "RdeVersionInUse", NoRdePrefix)
-			rdeVersionInUse = NoRdePrefix
+			rdeVersionInUseByCluster = NoRdePrefix
 		} else {
 			_, rdeVersion, err := capvcdRdeManager.GetRDEVersion(ctx, infraID)
 			if err != nil {
@@ -798,7 +854,7 @@ func (r *VCDClusterReconciler) reconcileNormal(ctx context.Context, cluster *clu
 					"\"Unexpected error retrieving RDE [%s] for the cluster [%s]", infraID, vcdCluster.Name)
 			}
 			// update the RdeVersionInUse with the entity type version of the rde.
-			rdeVersionInUse = rdeVersion
+			rdeVersionInUseByCluster = rdeVersion
 
 			// update the createdByVersion if not present already
 			if err := capvcdRdeManager.CheckForEmptyRDEAndUpdateCreatedByVersions(ctx, infraID); err != nil {
@@ -806,42 +862,48 @@ func (r *VCDClusterReconciler) reconcileNormal(ctx context.Context, cluster *clu
 			}
 		}
 
-		// upgrade RDE if necessary
+		//1. If infraID indicates that there is no RDE (Runtime Defined Entity), skip the RDE upgrade process.
+		//2. If vcdCluster.Status.RdeVersionInUse is empty, skip the RDE upgrade process.
+		//3. If version outdated is detected, proceed with the RDE upgrade process.
 		if !strings.Contains(infraID, NoRdePrefix) && vcdCluster.Status.RdeVersionInUse != "" &&
 			vcdCluster.Status.RdeVersionInUse != rdeType.CapvcdRDETypeVersion {
 			capvcdRdeManager := capisdk.NewCapvcdRdeManager(workloadVCDClient, infraID)
-			log.Info("Upgrading RDE", "rdeID", infraID,
-				"targetRDEVersion", rdeType.CapvcdRDETypeVersion)
-			_, err = capvcdRdeManager.ConvertToLatestRDEVersionFormat(ctx, infraID)
-			if err != nil {
-				log.Error(err, "failed to upgrade RDE", "rdeID", infraID,
-					"sourceVersion", vcdCluster.Status.RdeVersionInUse,
-					"targetVersion", rdeType.CapvcdRDETypeVersion)
-				err1 := capvcdRdeManager.AddToErrorSet(ctx, capisdk.RdeError, "", vcdCluster.Name, fmt.Sprintf("RDE upgrade failed: [%v]", err))
-				if err1 != nil {
-					log.Error(err1, "failed to add RdeError (RDE upgrade failed) ", "rdeID", infraID)
+			// 4. Skip the RDE upgrade process if the VCDKECluster flag is set to true
+			//    and current_rde_version < RDE should should be in use for a given CAPVCD version- rdeType.CapvcdRDETypeVersion always be the latest RDE version
+			if !capvcdRdeManager.IsVCDKECluster(ctx, infraID) && capisdk.CheckIfClusterRdeNeedsUpgrade(rdeVersionInUseByCluster, rdeType.CapvcdRDETypeVersion) {
+				log.Info("Upgrading RDE", "rdeID", infraID,
+					"targetRDEVersion", rdeType.CapvcdRDETypeVersion)
+				_, err = capvcdRdeManager.ConvertToLatestRDEVersionFormat(ctx, infraID)
+				if err != nil {
+					log.Error(err, "failed to upgrade RDE", "rdeID", infraID,
+						"sourceVersion", vcdCluster.Status.RdeVersionInUse,
+						"targetVersion", rdeType.CapvcdRDETypeVersion)
+					err1 := capvcdRdeManager.AddToErrorSet(ctx, capisdk.RdeError, "", vcdCluster.Name, fmt.Sprintf("RDE upgrade failed: [%v]", err))
+					if err1 != nil {
+						log.Error(err1, "failed to add RdeError (RDE upgrade failed) ", "rdeID", infraID)
+					}
+					return ctrl.Result{}, errors.Wrapf(err, "failed to upgrade RDE [%s]", infraID)
 				}
-				return ctrl.Result{}, errors.Wrapf(err, "failed to upgrade RDE [%s]", infraID)
-			}
-			// calling reconcileRDE here to avoid delay in updating the RDE contents
-			if err = r.reconcileRDE(ctx, cluster, vcdCluster, workloadVCDClient, "", false); err != nil {
-				// TODO: can we recover the RDE to a proper state if RDE fails to reconcile?
-				log.Error(err, "failed to reconcile RDE after upgrading RDE", "rdeID", infraID)
-				err1 := capvcdRdeManager.AddToErrorSet(ctx, capisdk.RdeError, "", vcdCluster.Name, fmt.Sprintf("failed to reconcile RDE after upgrading RDE: [%v]", err))
-				if err1 != nil {
-					log.Error(err1, "failed to add RdeError (RDE upgrade failed) ", "rdeID", infraID)
+				// calling reconcileRDE here to avoid delay in updating the RDE contents
+				if err = r.reconcileRDE(ctx, cluster, vcdCluster, workloadVCDClient, "", false); err != nil {
+					// TODO: can we recover the RDE to a proper state if RDE fails to reconcile?
+					log.Error(err, "failed to reconcile RDE after upgrading RDE", "rdeID", infraID)
+					err1 := capvcdRdeManager.AddToErrorSet(ctx, capisdk.RdeError, "", vcdCluster.Name, fmt.Sprintf("failed to reconcile RDE after upgrading RDE: [%v]", err))
+					if err1 != nil {
+						log.Error(err1, "failed to add RdeError (RDE upgrade failed) ", "rdeID", infraID)
+					}
+					return ctrl.Result{}, errors.Wrapf(err, "failed to reconcile RDE after upgrading RDE [%s]", infraID)
 				}
-				return ctrl.Result{}, errors.Wrapf(err, "failed to reconcile RDE after upgrading RDE [%s]", infraID)
+				err = capvcdRdeManager.AddToEventSet(ctx, capisdk.RdeUpgraded, infraID, "", "", skipRDEEventUpdates)
+				if err != nil {
+					log.Error(err, "failed to add RDE-upgrade event (RDE upgraded successfully) ", "rdeID", infraID)
+				}
+				err = capvcdRdeManager.RdeManager.RemoveErrorByNameOrIdFromErrorSet(ctx, vcdsdk.ComponentCAPVCD, capisdk.RdeError, "", "")
+				if err != nil {
+					log.Error(err, "failed to remove RdeError (RDE upgraded successfully) ", "rdeID", infraID)
+				}
+				rdeVersionInUseByCluster = rdeType.CapvcdRDETypeVersion
 			}
-			err = capvcdRdeManager.AddToEventSet(ctx, capisdk.RdeUpgraded, infraID, "", "", skipRDEEventUpdates)
-			if err != nil {
-				log.Error(err, "failed to add RDE-upgrade event (RDE upgraded successfully) ", "rdeID", infraID)
-			}
-			err = capvcdRdeManager.RdeManager.RemoveErrorByNameOrIdFromErrorSet(ctx, vcdsdk.ComponentCAPVCD, capisdk.RdeError, "", "")
-			if err != nil {
-				log.Error(err, "failed to remove RdeError (RDE upgraded successfully) ", "rdeID", infraID)
-			}
-			rdeVersionInUse = rdeType.CapvcdRDETypeVersion
 		}
 	}
 
@@ -850,18 +912,18 @@ func (r *VCDClusterReconciler) reconcileNormal(ctx context.Context, cluster *clu
 		log.Error(err, "failed to add RdeAvailable event", "rdeID", infraID)
 	}
 
-	if err := validateDerivedRDEProperties(vcdCluster, infraID, rdeVersionInUse); err != nil {
+	if err := validateDerivedRDEProperties(vcdCluster, infraID, rdeVersionInUseByCluster); err != nil {
 		log.Error(err, "Error validating derived infraID and RDE version")
 		return ctrl.Result{}, errors.Wrapf(err, "error validating derived infraID and RDE version with VCDCluster status")
 	}
 
-	if vcdCluster.Status.InfraId == "" || vcdCluster.Status.RdeVersionInUse != rdeVersionInUse {
+	if vcdCluster.Status.InfraId == "" || vcdCluster.Status.RdeVersionInUse != rdeVersionInUseByCluster {
 		// update the status
-		log.Info("updating vcdCluster with the following data", "vcdCluster.Status.InfraId", infraID, "vcdCluster.Status.RdeVersionInUse", rdeVersionInUse)
+		log.Info("updating vcdCluster with the following data", "vcdCluster.Status.InfraId", infraID, "vcdCluster.Status.RdeVersionInUse", rdeVersionInUseByCluster)
 
 		oldVCDCluster := vcdCluster.DeepCopy()
 		vcdCluster.Status.InfraId = infraID
-		vcdCluster.Status.RdeVersionInUse = rdeVersionInUse
+		vcdCluster.Status.RdeVersionInUse = rdeVersionInUseByCluster
 		if err := r.Status().Patch(ctx, vcdCluster, client.MergeFrom(oldVCDCluster)); err != nil {
 			updatedErr := capvcdRdeManager.AddToErrorSet(ctx, capisdk.CAPVCDObjectPatchError, "", vcdCluster.Name, fmt.Sprintf("failed to patch vcdcluster: [%v]", err))
 			if updatedErr != nil {
@@ -881,7 +943,7 @@ func (r *VCDClusterReconciler) reconcileNormal(ctx context.Context, cluster *clu
 	vcdCluster.Spec.RDEId = infraID
 
 	rdeManager := vcdsdk.NewRDEManager(workloadVCDClient, vcdCluster.Status.InfraId,
-		capisdk.StatusComponentNameCAPVCD, release.CAPVCDVersion)
+		capisdk.StatusComponentNameCAPVCD, release.Version)
 	// After InfraId has been set, we can update site, org, ovdcNetwork, parentUid, useAsManagementCluster
 	// proxyConfigSpec loadBalancerConfigSpec for vcdCluster status
 	vcdCluster.Status.Site = vcdCluster.Spec.Site
@@ -1167,17 +1229,28 @@ func (r *VCDClusterReconciler) reconcileDelete(ctx context.Context,
 		return ctrl.Result{}, errors.Wrap(err, "Error occurred during cluster deletion; failed to patch VCDCluster")
 	}
 
-	userCreds, err := getUserCredentialsForCluster(ctx, r.Client, vcdCluster.Spec.UserCredentialsContext)
+	workloadVCDClient, err := createVCDClientFromSecrets(ctx, r.Client, vcdCluster)
 	if err != nil {
-		return ctrl.Result{}, errors.Wrapf(err, "Error getting client credentials to reconcile Cluster [%s] infrastructure", vcdCluster.Name)
+		return ctrl.Result{}, errors.Wrapf(err, "Error creating VCD client to reconcile Cluster [%s] infrastructure", vcdCluster.Name)
 	}
-	workloadVCDClient, err := vcdsdk.NewVCDClientFromSecrets(vcdCluster.Spec.Site, vcdCluster.Spec.Org,
-		vcdCluster.Spec.Ovdc, vcdCluster.Spec.Org, userCreds.Username, userCreds.Password, userCreds.RefreshToken, true, true)
+
+	// close all idle connections when reconciliation is done
+	defer func() {
+		if workloadVCDClient != nil && workloadVCDClient.VCDClient != nil {
+			workloadVCDClient.VCDClient.Client.Http.CloseIdleConnections()
+			log.Info(fmt.Sprintf("closed connection to the http client [%#v]", workloadVCDClient.VCDClient.Client.Http))
+		}
+	}()
+
+	if workloadVCDClient.VDC == nil || workloadVCDClient.VDC.Vdc == nil {
+		return ctrl.Result{}, errors.Wrapf(err, "failed to get the Organization VDC (OVDC) from the VCD client for reconciling infrastructure of Cluster [%s]", vcdCluster.Name)
+	}
+
+	err = updateVcdResourceToVcdCluster(vcdCluster, ResourceTypeOvdc, workloadVCDClient.VDC.Vdc.ID, workloadVCDClient.VDC.Vdc.Name)
 	if err != nil {
-		return ctrl.Result{}, errors.Wrapf(err,
-			"Error occurred during cluster deletion; unable to create client for the workload cluster [%s]",
-			vcdCluster.Name)
+		return ctrl.Result{}, errors.Wrapf(err, "Error updating vcdResource into vcdcluster.status to reconcile Cluster [%s] infrastructure", vcdCluster.Name)
 	}
+
 	capvcdRdeManager := capisdk.NewCapvcdRdeManager(workloadVCDClient, vcdCluster.Status.InfraId)
 
 	gateway, err := vcdsdk.NewGatewayManager(ctx, workloadVCDClient, vcdCluster.Spec.OvdcNetwork, vcdCluster.Spec.LoadBalancerConfigSpec.VipSubnet, vcdCluster.Spec.Ovdc)
@@ -1308,7 +1381,7 @@ func (r *VCDClusterReconciler) reconcileDelete(ctx context.Context,
 	}
 	// Remove vapp from VCDResourceSet in the RDE
 	rdeManager := vcdsdk.NewRDEManager(workloadVCDClient, vcdCluster.Status.InfraId,
-		capisdk.StatusComponentNameCAPVCD, release.CAPVCDVersion)
+		capisdk.StatusComponentNameCAPVCD, release.Version)
 	err = rdeManager.RemoveFromVCDResourceSet(ctx, vcdsdk.ComponentCAPVCD, VCDResourceVApp, vcdCluster.Name)
 	if err != nil {
 		updatedErr := capvcdRdeManager.AddToErrorSet(ctx, capisdk.RdeError, "", vcdCluster.Name,
@@ -1345,7 +1418,7 @@ func (r *VCDClusterReconciler) reconcileDelete(ctx context.Context,
 				"obtained nil org when getting org by name [%s]", workloadVCDClient.ClusterOrgName)
 		}
 		definedEntities, resp, err := workloadVCDClient.APIClient.DefinedEntityApi.GetDefinedEntitiesByEntityType(ctx,
-			capisdk.CAPVCDTypeVendor, capisdk.CAPVCDTypeNss, rdeType.CapvcdRDETypeVersion, org.Org.ID, 1, 25,
+			capisdk.CAPVCDTypeVendor, capisdk.CAPVCDTypeNss, capisdk.CAPVCDEntityTypeDefaultMajorVersion, org.Org.ID, 1, 25,
 			&swagger.DefinedEntityApiGetDefinedEntitiesByEntityTypeOpts{
 				Filter: optional.NewString(fmt.Sprintf("id==%s", vcdCluster.Status.InfraId)),
 			})
@@ -1356,7 +1429,7 @@ func (r *VCDClusterReconciler) reconcileDelete(ctx context.Context,
 			}
 			return ctrl.Result{}, errors.Wrapf(err, "Error occurred during RDE deletion; failed to fetch defined entities by entity type [%s] and ID [%s] for cluster [%s]", CAPVCDEntityTypeID, vcdCluster.Status.InfraId, vcdCluster.Name)
 		}
-		if resp.StatusCode != http.StatusOK {
+		if resp != nil && resp.StatusCode != http.StatusOK {
 			err1 := capvcdRdeManager.AddToErrorSet(ctx, capisdk.RdeError, "", "", fmt.Sprintf("Got wrong status code while fetching RDE [%s]: %v", vcdCluster.Status.InfraId, err))
 			if err1 != nil {
 				log.Error(err1, "failed to add RdeError into RDE", "rdeID", vcdCluster.Status.InfraId)

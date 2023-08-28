@@ -7,7 +7,7 @@ import (
 	"github.com/blang/semver"
 	"github.com/pkg/errors"
 	"github.com/vmware/cloud-provider-for-cloud-director/pkg/vcdsdk"
-	swagger "github.com/vmware/cloud-provider-for-cloud-director/pkg/vcdswaggerclient"
+	swagger "github.com/vmware/cloud-provider-for-cloud-director/pkg/vcdswaggerclient_36_0"
 	"github.com/vmware/cluster-api-provider-cloud-director/pkg/util"
 	"github.com/vmware/cluster-api-provider-cloud-director/pkg/vcdtypes/rde_type_1_0_0"
 	"github.com/vmware/cluster-api-provider-cloud-director/pkg/vcdtypes/rde_type_1_1_0"
@@ -107,7 +107,7 @@ func NewCapvcdRdeManager(client *vcdsdk.Client, clusterID string) *CapvcdRdeMana
 		RdeManager: &vcdsdk.RDEManager{
 			Client:                 client,
 			StatusComponentName:    StatusComponentNameCAPVCD,
-			StatusComponentVersion: release.CAPVCDVersion,
+			StatusComponentVersion: release.Version,
 			ClusterID:              clusterID,
 		},
 	}
@@ -123,6 +123,20 @@ func convertToMap(obj interface{}) (map[string]interface{}, error) {
 		return nil, fmt.Errorf("failed to convert byte array [%s] to map[string]interface{}: [%v]", string(byteArr), err)
 	}
 	return parsedMap, nil
+}
+
+func CheckIfClusterRdeNeedsUpgrade(srcRdeTypeVersion string, tgtRdeTypeVersion string) bool {
+	entityTypeSemVer, err := semver.New(srcRdeTypeVersion)
+	if err != nil {
+		klog.Errorf("fail to convert [%s] into a semantic version: [%v]", srcRdeTypeVersion, err)
+		return false
+	}
+	tgtRdeTypeVersionSemVer, err := semver.New(tgtRdeTypeVersion)
+	if err != nil {
+		klog.Errorf("fail to convert [%s] into a semantic version: [%v]", srcRdeTypeVersion, err)
+		return false
+	}
+	return entityTypeSemVer.LT(*tgtRdeTypeVersionSemVer)
 }
 
 func patchObject(inputObj interface{}, patchMap map[string]interface{}) (map[string]interface{}, error) {
@@ -320,6 +334,70 @@ func (capvcdRdeManager *CapvcdRdeManager) GetRDEVersion(ctx context.Context, rde
 	entiyTypeSplitArr := strings.Split(definedEntity.EntityType, ":")
 	// last item of the array will be the version string
 	return &definedEntity, entiyTypeSplitArr[len(entiyTypeSplitArr)-1], nil
+}
+
+// IsVCDKECluster only returns true/false, not return error.
+// all the errors showing inside the function are all checked in the previous code.
+func (capvcdRdeManager *CapvcdRdeManager) IsVCDKECluster(ctx context.Context, rdeID string) bool {
+	client := capvcdRdeManager.Client
+	org, err := client.VCDClient.GetOrgByName(client.ClusterOrgName)
+	if err != nil {
+		klog.Errorf("error getting org by name for org [%s] in the defined entity [%s]: [%v]", client.ClusterOrgName, rdeID, err)
+		return false
+	}
+
+	if org == nil || org.Org == nil {
+		klog.Errorf("obtained nil org when getting org by name [%s] in the defined entity [%s]", client.ClusterOrgName, rdeID)
+		return false
+	}
+
+	rde, resp, _, err := client.APIClient.DefinedEntityApi.GetDefinedEntity(ctx, rdeID, org.Org.ID)
+	if err != nil {
+		klog.Errorf("failed to get defined entity with ID [%s]: [%v]", rdeID, err)
+		return false
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		klog.Errorf("obtained unexpected http status [%d] when getting the defined entity with ID [%s]", resp.StatusCode, rdeID)
+		return false
+	}
+
+	specEntry, ok := rde.Entity["spec"]
+	if !ok {
+		klog.Errorf("could not find 'spec' entry in the defined entity [%s]", rdeID)
+		return false
+	}
+
+	specMap, ok := specEntry.(map[string]interface{})
+	if !ok {
+		klog.Errorf("unable to convert [%T] to map in the defined entity [%s]", specMap, rdeID)
+		return false
+	}
+	// if the vcdKeSpec section is present, then the cluster is not managed by standalone CAPVCD.
+	vcdKESpecEntry, ok := specMap["vcdKe"]
+	if !ok {
+		return false
+	}
+
+	vcdKESpecMap, ok := vcdKESpecEntry.(map[string]interface{})
+	if !ok {
+		klog.Errorf("unable to convert [%T] to map in the defined entity [%s]", vcdKESpecEntry, rdeID)
+		return false
+	}
+
+	isVCDKECluster, ok := vcdKESpecMap["isVCDKECluster"]
+	if !ok {
+		klog.Errorf("key 'isVCDKECluster' is missing in the defined entity [%s]", rdeID)
+		return false
+	}
+
+	isVCDKEClusterValue, ok := isVCDKECluster.(bool)
+	if !ok {
+		klog.Errorf("unable to convert [%T] to boolean value", isVCDKECluster)
+		return false
+	}
+
+	return isVCDKEClusterValue
 }
 
 // EntityType contains only the required properties in get entity type response
@@ -620,7 +698,7 @@ func (capvcdRdeManager *CapvcdRdeManager) ConvertToLatestRDEVersionFormat(ctx co
 func (capvcdRdeManager *CapvcdRdeManager) CheckForEmptyRDEAndUpdateCreatedByVersions(ctx context.Context, infraId string) error {
 
 	if capvcdRdeManager.RdeManager == nil {
-		return fmt.Errorf("nil rdeManager found while updating RDE [%s] with createdBy version [%s]", infraId, release.CAPVCDVersion)
+		return fmt.Errorf("nil rdeManager found while updating RDE [%s] with createdBy version [%s]", infraId, release.Version)
 	}
 
 	client := capvcdRdeManager.Client
@@ -655,12 +733,12 @@ func (capvcdRdeManager *CapvcdRdeManager) CheckForEmptyRDEAndUpdateCreatedByVers
 		}
 	}
 	capvcdStatusPatch := make(map[string]interface{})
-	capvcdStatusPatch["CreatedByVersion"] = release.CAPVCDVersion
+	capvcdStatusPatch["CreatedByVersion"] = release.Version
 	_, err = capvcdRdeManager.PatchRDE(ctx, nil, nil, capvcdStatusPatch, infraId, "", false)
 	if err != nil {
-		return fmt.Errorf("failed to update CAPVCD status with created by version [%s] for RDE [%s]", release.CAPVCDVersion, infraId)
+		return fmt.Errorf("failed to update CAPVCD status with created by version [%s] for RDE [%s]", release.Version, infraId)
 	}
-	klog.V(4).Infof("successfully updated CAPVCD status with created by version [%s] for RDE [%s]", release.CAPVCDVersion, infraId)
+	klog.V(4).Infof("successfully updated CAPVCD status with created by version [%s] for RDE [%s]", release.Version, infraId)
 	return nil
 }
 

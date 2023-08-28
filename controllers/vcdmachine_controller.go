@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"math"
 	"reflect"
+	"sigs.k8s.io/yaml"
 	"strconv"
 	"strings"
 	"text/template"
@@ -29,7 +30,6 @@ import (
 	"github.com/vmware/cluster-api-provider-cloud-director/release"
 	"github.com/vmware/go-vcloud-director/v2/govcd"
 	"github.com/vmware/go-vcloud-director/v2/types/v56"
-	"gopkg.in/yaml.v2"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/klog"
@@ -114,7 +114,7 @@ func (r *VCDMachineReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 		return ctrl.Result{}, err
 	}
 	if cluster == nil {
-		log.Info("Please associate this machine with a cluster using the label", "label", clusterv1.ClusterLabelName)
+		log.Info("Please associate this machine with a cluster using the label", "label", clusterv1.ClusterNameLabel)
 		return ctrl.Result{}, nil
 	}
 
@@ -213,17 +213,11 @@ const (
 	PostCustomizationScriptFailureReason   = "guestinfo.post_customization_script_execution_failure_reason"
 )
 
-var controlPlanePostCustPhases = []string{
+var postCustPhases = []string{
 	NetworkConfiguration,
 	MeteringConfiguration,
 	ProxyConfiguration,
-	KubeadmInit,
-}
-
-var joinPostCustPhases = []string{
-	NetworkConfiguration,
-	MeteringConfiguration,
-	KubeadmNodeJoin,
+	NvidiaRuntimeInstall,
 }
 
 func removeFromSlice(remove string, arr []string) []string {
@@ -345,14 +339,26 @@ func (r *VCDMachineReconciler) reconcileNormal(ctx context.Context, cluster *clu
 	// To avoid spamming RDEs with updates, only update the RDE with events when machine creation is ongoing
 	skipRDEEventUpdates := machine.Status.BootstrapReady
 
-	userCreds, err := getUserCredentialsForCluster(ctx, r.Client, vcdCluster.Spec.UserCredentialsContext)
+	workloadVCDClient, err := createVCDClientFromSecrets(ctx, r.Client, vcdCluster)
 	if err != nil {
-		return ctrl.Result{}, errors.Wrapf(err, "Error getting client credentials to reconcile Cluster [%s] infrastructure", vcdCluster.Name)
+		return ctrl.Result{}, errors.Wrapf(err, "Error creating VCD client to reconcile Cluster [%s] infrastructure", vcdCluster.Name)
 	}
-	workloadVCDClient, err := vcdsdk.NewVCDClientFromSecrets(vcdCluster.Spec.Site, vcdCluster.Spec.Org,
-		vcdCluster.Spec.Ovdc, vcdCluster.Spec.Org, userCreds.Username, userCreds.Password, userCreds.RefreshToken, true, true)
+
+	// close all idle connections when reconciliation is done
+	defer func() {
+		if workloadVCDClient != nil && workloadVCDClient.VCDClient != nil {
+			workloadVCDClient.VCDClient.Client.Http.CloseIdleConnections()
+			log.Info(fmt.Sprintf("closed connection to the http client [%#v]", workloadVCDClient.VCDClient.Client.Http))
+		}
+	}()
+
+	if workloadVCDClient.VDC == nil || workloadVCDClient.VDC.Vdc == nil {
+		return ctrl.Result{}, errors.Wrapf(err, "failed to get the Organization VDC (OVDC) from the VCD client for reconciling infrastructure of Cluster [%s]", vcdCluster.Name)
+	}
+
+	err = updateVcdResourceToVcdCluster(vcdCluster, ResourceTypeOvdc, workloadVCDClient.VDC.Vdc.ID, workloadVCDClient.VDC.Vdc.Name)
 	if err != nil {
-		return ctrl.Result{}, errors.Wrapf(err, "Unable to create VCD client to reconcile infrastructure for the Machine [%s]", machine.Name)
+		return ctrl.Result{}, errors.Wrapf(err, "Error updating vcdResource into vcdcluster.status to reconcile Cluster [%s] infrastructure", vcdCluster.Name)
 	}
 
 	capvcdRdeManager := capisdk.NewCapvcdRdeManager(workloadVCDClient, vcdCluster.Status.InfraId)
@@ -511,7 +517,7 @@ func (r *VCDMachineReconciler) reconcileNormal(ctx context.Context, cluster *clu
 	cloudInit := string(mergedCloudInitBytes)
 
 	// nothing is redacted in the cloud init script - please ensure no secrets are present
-	log.Info(fmt.Sprintf("Cloud init Script: [%s]", cloudInit))
+	log.V(2).Info(fmt.Sprintf("Cloud init Script: [%s]", cloudInit))
 	err = capvcdRdeManager.AddToEventSet(ctx, capisdk.CloudInitScriptGenerated, "", machine.Name, "", skipRDEEventUpdates)
 	if err != nil {
 		log.Error(err, "failed to add CloudInitScriptGenerated event into RDE", "rdeID", vcdCluster.Status.InfraId)
@@ -824,16 +830,23 @@ func (r *VCDMachineReconciler) reconcileNormal(ctx context.Context, cluster *clu
 	if err != nil {
 		log.Error(err, "failed to remove VCDMachineCreationError from RDE", "rdeID", vcdCluster.Status.InfraId)
 	}
-	//Todo: add remove here
-	// wait for each vm phase
-	phases := controlPlanePostCustPhases
-	if !useControlPlaneScript {
-		if vcdMachine.Spec.EnableNvidiaGPU {
-			phases = []string{joinPostCustPhases[0], joinPostCustPhases[1], NvidiaRuntimeInstall}
-		} else {
-			phases = joinPostCustPhases
-		}
+
+	phases := postCustPhases
+	if useControlPlaneScript {
+		phases = append(phases, KubeadmInit)
+	} else {
+		phases = append(phases, KubeadmNodeJoin)
 	}
+
+	if !vcdMachine.Spec.EnableNvidiaGPU {
+		phases = removeFromSlice(NvidiaRuntimeInstall, phases)
+	}
+
+	if vcdCluster.Spec.ProxyConfigSpec.HTTPSProxy == "" &&
+		vcdCluster.Spec.ProxyConfigSpec.HTTPProxy == "" {
+		phases = removeFromSlice(ProxyConfiguration, phases)
+	}
+
 	for _, phase := range phases {
 		if err = vApp.Refresh(); err != nil {
 			err1 := capvcdRdeManager.AddToErrorSet(ctx, capisdk.VCDMachineScriptExecutionError, "", machine.Name, fmt.Sprintf("%v", err))
@@ -1056,7 +1069,7 @@ func (r *VCDMachineReconciler) getBootstrapData(ctx context.Context, machine *cl
 		return "", errors.New("error retrieving bootstrap data: secret value key is missing")
 	}
 
-	log.Info(fmt.Sprintf("Auto-generated bootstrap script: [%s]", string(value)))
+	log.V(2).Info(fmt.Sprintf("Auto-generated bootstrap script: [%s]", string(value)))
 
 	return string(value), nil
 }
@@ -1081,15 +1094,35 @@ func (r *VCDMachineReconciler) reconcileDelete(ctx context.Context, cluster *clu
 		return ctrl.Result{}, nil
 	}
 
-	userCreds, err := getUserCredentialsForCluster(ctx, r.Client, vcdCluster.Spec.UserCredentialsContext)
+	workloadVCDClient, err := createVCDClientFromSecrets(ctx, r.Client, vcdCluster)
 	if err != nil {
-		return ctrl.Result{}, errors.Wrapf(err, "Error getting client credentials to reconcile Cluster [%s] infrastructure", vcdCluster.Name)
+		return ctrl.Result{}, errors.Wrapf(err, "Error creating VCD client to reconcile Cluster [%s] infrastructure", vcdCluster.Name)
 	}
-	workloadVCDClient, err := vcdsdk.NewVCDClientFromSecrets(vcdCluster.Spec.Site, vcdCluster.Spec.Org,
-		vcdCluster.Spec.Ovdc, vcdCluster.Spec.Org, userCreds.Username, userCreds.Password, userCreds.RefreshToken, true, true)
+
+	// close all idle connections when reconciliation is done
+	defer func() {
+		if workloadVCDClient != nil && workloadVCDClient.VCDClient != nil {
+			workloadVCDClient.VCDClient.Client.Http.CloseIdleConnections()
+			log.Info(fmt.Sprintf("closed connection to the http client [%#v]", workloadVCDClient.VCDClient.Client.Http))
+		}
+	}()
+
+	if workloadVCDClient.VDC == nil || workloadVCDClient.VDC.Vdc == nil {
+		return ctrl.Result{}, errors.Wrapf(err, "failed to get the Organization VDC (OVDC) from the VCD client for reconciling infrastructure of Cluster [%s]", vcdCluster.Name)
+	}
+
+	err = updateVcdResourceToVcdCluster(vcdCluster, ResourceTypeOvdc, workloadVCDClient.VDC.Vdc.ID, workloadVCDClient.VDC.Vdc.Name)
+	if err != nil {
+		return ctrl.Result{}, errors.Wrapf(err, "Error updating vcdResource into vcdcluster.status to reconcile Cluster [%s] infrastructure", vcdCluster.Name)
+	}
+
 	capvcdRdeManager := capisdk.NewCapvcdRdeManager(workloadVCDClient, vcdCluster.Status.InfraId)
 	if err != nil {
 		return ctrl.Result{}, errors.Wrapf(err, "Unable to create VCD client to reconcile infrastructure for the Machine [%s]", machine.Name)
+	}
+	err = updateClientWithVDC(vcdCluster, workloadVCDClient)
+	if err != nil {
+		return ctrl.Result{}, errors.Wrapf(err, "Error updating VCD client with VDC to reconcile Cluster [%s] infrastructure", vcdCluster.Name)
 	}
 
 	gateway, err := vcdsdk.NewGatewayManager(ctx, workloadVCDClient, vcdCluster.Spec.OvdcNetwork, vcdCluster.Spec.LoadBalancerConfigSpec.VipSubnet, vcdCluster.Spec.Ovdc)
@@ -1316,7 +1349,7 @@ func (r *VCDMachineReconciler) reconcileDelete(ctx context.Context, cluster *clu
 		}
 	}
 	// Remove VM from VCDResourceSet of RDE
-	rdeManager := vcdsdk.NewRDEManager(workloadVCDClient, vcdCluster.Status.InfraId, capisdk.StatusComponentNameCAPVCD, release.CAPVCDVersion)
+	rdeManager := vcdsdk.NewRDEManager(workloadVCDClient, vcdCluster.Status.InfraId, capisdk.StatusComponentNameCAPVCD, release.Version)
 	err = rdeManager.RemoveFromVCDResourceSet(ctx, vcdsdk.ComponentCAPVCD, VcdResourceTypeVM, machine.Name)
 	if err != nil {
 		updatedErr := capvcdRdeManager.AddToErrorSet(ctx, capisdk.RdeError, "", machine.Name,
@@ -1388,7 +1421,7 @@ func (r *VCDMachineReconciler) VCDClusterToVCDMachines(o client.Object) []ctrl.R
 		return result
 	}
 
-	labels := map[string]string{clusterv1.ClusterLabelName: cluster.Name}
+	labels := map[string]string{clusterv1.ClusterNameLabel: cluster.Name}
 	machineList := &clusterv1.MachineList{}
 	if err := r.Client.List(context.TODO(), machineList, client.InNamespace(c.Namespace),
 		client.MatchingLabels(labels)); err != nil {
